@@ -38,17 +38,22 @@ namespace s3mirror
 
             var hexes = chunkHashes.ToArray();
 
-            var largeHash = Combine(hexes);
+            return Calculate(hexes);
+        }
+
+        public static string Calculate(IList<byte[]> parts)
+        {
+            var largeHash = Combine(parts);
 
             using (var e = MD5.Create())
             {
                 var hashOfCombinedHashes = e.ComputeHash(largeHash, 0, largeHash.Length);
                 var hex = hashOfCombinedHashes.ToHex();
-                return hex + "-" + hexes.Length;
+                return hex + "-" + parts.Count;
             }
         }
 
-        static byte[] Combine(params byte[][] arrays)
+        static byte[] Combine(IList<byte[]> arrays)
         {
             byte[] ret = new byte[arrays.Sum(x => x.Length)];
             int offset = 0;
