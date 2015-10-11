@@ -16,10 +16,9 @@ namespace s3mirror
 {
     internal class Program
     {
-
-        static readonly RegionEndpoint region;
-        static readonly string awsAccessKeyId;
-        static readonly string awsSecretAccessKey;
+        static RegionEndpoint awsRegion;
+        static string awsAccessKeyId;
+        static string awsSecretAccessKey;
 
         private static readonly ILog Log = LogManager.GetLogger(typeof(Program));
         private static bool ignoreMultipartMd5 = true;
@@ -54,10 +53,54 @@ namespace s3mirror
         {
             log4net.Config.XmlConfigurator.Configure();
 
+
+            AwsSettings awsSettings = AwsSettings.Default;
+            awsSettings.Reload();
+            awsAccessKeyId = awsSettings.AccessKeyId;
+            awsSecretAccessKey = awsSettings.SecretAccessKey;
+            awsRegion = RegionEndpoint.GetBySystemName(awsSettings.Region);
+
+            if (string.IsNullOrEmpty(awsAccessKeyId))
+            {
+                Console.Write("AccessKeyId: ");
+                awsSettings.AccessKeyId = Console.ReadLine();
+                Console.Write("SecretAccessKey: ");
+                awsSettings.SecretAccessKey = Console.ReadLine();
+                Console.Write("Region: ");
+                awsSettings.Region = Console.ReadLine();
+                awsSettings.Save();
+                return;
+            }
+
+            var src = AwsSettings.Default.Src;
+            var dst = AwsSettings.Default.Dst;
+
+            AskValue("From", ref src);
+            AskValue("To", ref dst);
+
+            AwsSettings.Default.Src = src;
+            AwsSettings.Default.Dst = dst;
+            AwsSettings.Default.Save();
+
             //CopyFrom(args[0], args[1]);
-            CopyTo(args[0], args[1]);
+            CopyTo(src, dst);
+
         }
 
+        private static void AskValue(string label, ref string src)
+        {
+            Console.WriteLine("{0} [{1}]: ", label, src);
+            var val = Console.ReadLine();
+            if (!string.IsNullOrEmpty(val))
+            {
+                src = val;
+            }
+        }
+
+        static IAmazonS3 CreateS3Client()
+        {
+            return new AmazonS3Client(awsAccessKeyId, awsSecretAccessKey, awsRegion);
+        }
 
         static Item Map(string root, FileInfo src)
         {
@@ -89,6 +132,8 @@ namespace s3mirror
                 .Where(x => !x.Attributes.HasFlag(FileAttributes.Hidden))
                 .Where(x => !x.Name.StartsWith("."))
                 .Where(x => x.FullName != md5File)
+                .Where(x => (x.Attributes & FileAttributes.Archive) == FileAttributes.Archive)
+                .Where(x => (x.Attributes & FileAttributes.Temporary) != FileAttributes.Temporary)
                 .Select(x => Map(src, x));
 
             using (var md5FileWriter = File.AppendText(md5File))
@@ -111,7 +156,7 @@ namespace s3mirror
                     }
                     x.Hash = item.Md5;
                     return x;
-                });
+                }).ToList();
             }
 
             WriteMd5Dictionary(md5Dictionary, md5File);
@@ -120,14 +165,53 @@ namespace s3mirror
                 .Select(x => Map(dstPath, x))
                 .ToDictionary(x => x.Relative, x => x);
 
+            int chunkSize = 1024 * 1024 * 8; //8MB
+
+            Log.DebugFormat("Chunk size: {0} ({1} bytes)", Pretty(chunkSize), chunkSize);
+
+            /*
+                        Alleen files die:
+                        - nog niet bestaan
+                         of een andere lengte hebben
+                         of een andere hash md5 hebben
+             *  of een andere hash s3md5 hebben
+                        */
             var items = files
-                .Where(x => !objects.ContainsKey(x.Relative) || x.Hash != objects[x.Relative].Hash)
+                .Where(x =>
+                {
+                    var destinationNotExists = !objects.ContainsKey(x.Relative);
+
+                    if (destinationNotExists) return true;
+
+                    var obj = objects[x.Relative];
+
+                    var differentSize = x.Length != obj.Length;
+
+                    if (differentSize) return true;
+
+                    var etag = obj.S3Object.ETag;
+                    var isMultiPart = etag.Contains("-");
+
+                    if (isMultiPart)
+                    {
+                        var parts = ExtractParts(etag);
+                        var guestimateChunkSize = GuessChunkSize(obj.Length, parts);
+                        var s3md5mismatch = !obj.Hash.Contains(S3Md5.Calculate(x.Path, guestimateChunkSize));
+                        return s3md5mismatch;
+                    }
+                    else
+                    {
+                        var md5mismatch = x.Hash != obj.Hash;
+                        return md5mismatch;
+                    }
+                }
+                )
                 .ToList();
 
             Log.InfoFormat("Items to be mirrored: {0}", items.Count);
 
-            var chunkSize = 1024 * 1024 * 8; //8MB
-            using (IAmazonS3 client = new AmazonS3Client(awsAccessKeyId, awsSecretAccessKey, region))
+
+            using (IAmazonS3 client = CreateS3Client())
                 foreach (var item in items)
                 {
                     var key = dstPath + item.Relative;
@@ -139,38 +223,40 @@ namespace s3mirror
                         client.UploadObjectFromFilePath(dstBucket, key, item.Path, null);
                         var isMatch = client.GetObject(dstBucket, key).ETag.Contains(item.Hash);
 
-                        if(!isMatch) Log.ErrorFormat("Upload failed: {0}",item.Relative);
+                        if (!isMatch) Log.ErrorFormat("Upload failed: {0}", item.Relative);
                     }
                     else
                     {
+                        Log.Debug("Multi-part");
                         var response = client.InitiateMultipartUpload(dstBucket, key);
                         try
                         {
-
-                            var index = 0;
+                            long index = 0;
 
                             var md5s = new List<PartETag>();
 
                             for (int part = 1; index < item.Length; part++)
                             {
-                                var md5 = Md5Hash.Calculate(item.Path, index, chunkSize).ToHex();
+                                var md5 = Md5Hash.Calculate(item.Path, index, chunkSize);
+                                var partSize = Math.Min(chunkSize, item.Length - index);
+
+                                Log.DebugFormat("\tPart {0} ({1:N0}): {2}", part, partSize, md5.ToHex());
 
                                 client.UploadPart(new UploadPartRequest
                                 {
                                     Key = key,
                                     BucketName = dstBucket,
                                     FilePath = item.Path,
-                                    FilePosition = 0,
+                                    FilePosition = index,
                                     PartNumber = part,
                                     PartSize = chunkSize,
                                     UploadId = response.UploadId,
-                                    MD5Digest = md5
+                                    MD5Digest = System.Convert.ToBase64String(md5),
                                 });
 
-                                md5s.Add(new PartETag(part, md5));
+                                md5s.Add(new PartETag(part, md5.ToHex()));
 
-                                Log.DebugFormat("\tPart {0} : {1}", part, md5);
-                                index += chunkSize;
+                                index += partSize;
                             }
 
                             client.CompleteMultipartUpload(new CompleteMultipartUploadRequest
@@ -179,10 +265,7 @@ namespace s3mirror
                                 BucketName = dstBucket,
                                 PartETags = md5s,
                                 UploadId = response.UploadId,
-                                
                             });
-
-                            Log.DebugFormat("\ts3md5: {0}", S3Md5.Calculate(item.Path, chunkSize));
                         }
                         catch (Exception ex)
                         {
@@ -190,8 +273,18 @@ namespace s3mirror
                             client.AbortMultipartUpload(dstBucket, key, response.UploadId);
                         }
                     }
+
+                    File.SetAttributes(item.Path, File.GetAttributes(item.Path) & ~FileAttributes.Archive);
                 }
 
+        }
+
+        private static int ExtractParts(string etag)
+        {
+            var i = etag.IndexOf("-", 33, StringComparison.OrdinalIgnoreCase);
+            if (i < 0) return 1;
+            var parts = int.Parse(etag.Substring(i + 1, etag.Length - 3 - 32));
+            return parts;
         }
 
 
@@ -204,6 +297,9 @@ namespace s3mirror
                     w.WriteLine(i.Value);
                 }
             }
+
+            var attr = File.GetAttributes(md5File) | FileAttributes.Hidden;
+            File.SetAttributes(md5File, attr);
         }
 
         private static Item Map(string root, S3Object src)
@@ -317,7 +413,7 @@ namespace s3mirror
 
         private static byte[] DownloadAndHash(string bucket, string key, string dst, long size)
         {
-            using (IAmazonS3 client = new AmazonS3Client(awsAccessKeyId, awsSecretAccessKey, region))
+            using (IAmazonS3 client = CreateS3Client())
             {
                 GetObjectRequest request = new GetObjectRequest
                 {
@@ -363,7 +459,7 @@ namespace s3mirror
             //var fn = "s3.txt";
 
             var start = Stopwatch.StartNew();
-            using (IAmazonS3 client = new AmazonS3Client(awsAccessKeyId, awsSecretAccessKey, region))
+            using (IAmazonS3 client = CreateS3Client())
             {
                 //using (var f = File.OpenWrite(fn))
                 //using (var w = new StreamWriter(f, Encoding.UTF8))
@@ -609,7 +705,6 @@ namespace s3mirror
                 // 200 
 
                 if (chunkSize > partSize)
-
                     return chunkSize;
             }
         }

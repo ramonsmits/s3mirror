@@ -58,5 +58,29 @@ namespace s3mirror {
                 this["Region"] = value;
             }
         }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string Src {
+            get {
+                return ((string)(this["Src"]));
+            }
+            set {
+                this["Src"] = value;
+            }
+        }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string Dst {
+            get {
+                return ((string)(this["Dst"]));
+            }
+            set {
+                this["Dst"] = value;
+            }
+        }
     }
 }
